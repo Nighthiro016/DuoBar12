@@ -1,0 +1,811 @@
+name: Build DuoBar (iPhone 5s, iOS 12) - all in one
+
+# Paste this single file into a new repo as .github/workflows/build.yml.
+# It writes the whole project at build time, builds the .deb and uploads it as an artifact.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Install tools
+        run: brew install ldid dpkg make
+
+      - name: Install Theos and SDKs
+        run: |
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$HOME/theos"
+          git clone --depth=1 https://github.com/theos/sdks.git /tmp/sdks
+          mkdir -p "$HOME/theos/sdks"
+          mv /tmp/sdks/*.sdk "$HOME/theos/sdks/"
+
+      - name: Write project files
+        run: |
+          mkdir -p DuoBar12 DuoBar12/duobarprefs DuoBar12/duobarprefs/Resources DuoBar12/layout/Library/PreferenceLoader/Preferences
+          cat > DuoBar12/Makefile <<'__DUOEOF__'
+          # DuoBar for iPhone 5s (arm64) on iOS 12, rootful (unc0ver / checkra1n / Odyssey-era layout).
+          TARGET := iphone:clang:latest:12.0
+          ARCHS = arm64
+          INSTALL_TARGET_PROCESSES = SpringBoard
+
+          include $(THEOS)/makefiles/common.mk
+
+          TWEAK_NAME = DuoBar12
+          DuoBar12_FILES = Tweak.xm DuoGlyphView.m
+          DuoBar12_CFLAGS = -fobjc-arc -Wall -Wno-deprecated-declarations
+          DuoBar12_FRAMEWORKS = UIKit CoreGraphics QuartzCore SystemConfiguration
+
+          include $(THEOS_MAKE_PATH)/tweak.mk
+
+          SUBPROJECTS += duobarprefs
+          include $(THEOS_MAKE_PATH)/aggregate.mk
+          __DUOEOF__
+          cat > DuoBar12/control <<'__DUOEOF__'
+          Package: local.duobar.ios12
+          Name: DuoBar (iPhone 5s, iOS 12)
+          Version: 1.0.0
+          Architecture: iphoneos-arm
+          Description: Duo-style circular battery, Wi-Fi and cellular indicator for the legacy iOS 12 status bar (iPhone 5s).
+          Maintainer: DuoBar iOS 12 port
+          Author: Inspired by DuoBar by RBx9 and Mikeli7666 (both MIT)
+          Section: Tweaks
+          Depends: mobilesubstrate, preferenceloader, firmware (>= 12.0), firmware (<< 13.0)
+          __DUOEOF__
+          cat > DuoBar12/DuoBar12.plist <<'__DUOEOF__'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>Filter</key>
+          	<dict>
+          		<key>Bundles</key>
+          		<array>
+          			<string>com.apple.UIKit</string>
+          		</array>
+          	</dict>
+          </dict>
+          </plist>
+          __DUOEOF__
+          cat > DuoBar12/DuoGlyphView.h <<'__DUOEOF__'
+          #import <UIKit/UIKit.h>
+
+          #define DUO_DOMAIN @"local.duobar.ios12"
+          #define DUO_PREFS_NOTIFICATION CFSTR("local.duobar.ios12/prefs")
+
+          extern NSString *const DuoStateDidChangeNotification;
+
+          // Shared, process-local state: preferences plus signal data scraped from the native status bar items.
+          @interface DuoState : NSObject
+          + (instancetype)shared;
+          @property (atomic, assign) BOOL enabled;
+          @property (atomic, assign) BOOL showPercent;
+          @property (atomic, assign) NSInteger sizePercent;   // 70...140
+          @property (atomic, assign) NSInteger colorMode;     // 0 auto, 1 white, 2 black
+          @property (atomic, assign) NSInteger cellBars;      // raw legacy bars, 0...5, -1 unknown
+          @property (atomic, assign) NSInteger wifiBars;      // raw legacy bars, 0...3
+          @property (atomic, assign) BOOL wifiVisible;
+          - (void)reloadPrefs;
+          - (void)notifyChanged;
+          @end
+
+          @interface DuoGlyphView : UIView
+          + (CGFloat)preferredWidth;
+          @end
+          __DUOEOF__
+          cat > DuoBar12/DuoGlyphView.m <<'__DUOEOF__'
+          #import "DuoGlyphView.h"
+
+          NSString *const DuoStateDidChangeNotification = @"local.duobar.ios12.stateChanged";
+
+          static id DuoPref(NSString *key) {
+              CFPropertyListRef v = CFPreferencesCopyAppValue((__bridge CFStringRef)key, (__bridge CFStringRef)DUO_DOMAIN);
+              return CFBridgingRelease(v);
+          }
+
+          @implementation DuoState
+
+          + (instancetype)shared {
+              static DuoState *s;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{
+                  s = [DuoState new];
+                  s.cellBars = -1;
+                  s.wifiBars = 0;
+                  s.wifiVisible = NO;
+                  [s reloadPrefs];
+              });
+              return s;
+          }
+
+          - (void)reloadPrefs {
+              CFPreferencesAppSynchronize((__bridge CFStringRef)DUO_DOMAIN);
+              id e = DuoPref(@"Enabled");
+              id p = DuoPref(@"ShowPercent");
+              id z = DuoPref(@"SizeScale");
+              id c = DuoPref(@"ColorMode");
+              self.enabled = e ? [e boolValue] : YES;
+              self.showPercent = p ? [p boolValue] : YES;
+              NSInteger size = z ? (NSInteger)lround([z doubleValue]) : 100;
+              self.sizePercent = MAX(70, MIN(140, size));
+              self.colorMode = c ? [c integerValue] : 0;
+          }
+
+          - (void)notifyChanged {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  [[NSNotificationCenter defaultCenter] postNotificationName:DuoStateDidChangeNotification object:nil];
+              });
+          }
+
+          @end
+
+          // Design box the glyph is drawn in; scaled to the real size at draw time.
+          static const CGFloat kBox = 24.0;
+
+          @implementation DuoGlyphView
+
+          + (CGFloat)scale {
+              return (CGFloat)[DuoState shared].sizePercent / 100.0;
+          }
+
+          + (CGFloat)glyphSide {
+              return 18.0 * [self scale];
+          }
+
+          + (UIFont *)percentFont {
+              return [UIFont systemFontOfSize:11.0 * [self scale] weight:UIFontWeightSemibold];
+          }
+
+          + (CGFloat)percentWidth {
+              // Measured on the widest value so the status bar layout never shifts while charging.
+              return ceil([@"100%" sizeWithAttributes:@{NSFontAttributeName: [self percentFont]}].width);
+          }
+
+          + (CGFloat)preferredWidth {
+              CGFloat w = [self glyphSide] + 2.0;
+              if ([DuoState shared].showPercent) w += [self percentWidth] + 3.0 * [self scale];
+              return ceil(w);
+          }
+
+          - (instancetype)initWithFrame:(CGRect)frame {
+              self = [super initWithFrame:frame];
+              if (self) {
+                  self.opaque = NO;
+                  self.backgroundColor = [UIColor clearColor];
+                  self.userInteractionEnabled = NO;
+                  self.contentMode = UIViewContentModeRedraw;
+                  self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+                  [UIDevice currentDevice].batteryMonitoringEnabled = YES;
+                  NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+                  [nc addObserver:self selector:@selector(refresh) name:UIDeviceBatteryLevelDidChangeNotification object:nil];
+                  [nc addObserver:self selector:@selector(refresh) name:UIDeviceBatteryStateDidChangeNotification object:nil];
+                  [nc addObserver:self selector:@selector(refresh) name:NSProcessInfoPowerStateDidChangeNotification object:nil];
+                  [nc addObserver:self selector:@selector(refresh) name:DuoStateDidChangeNotification object:nil];
+              }
+              return self;
+          }
+
+          - (void)dealloc {
+              [[NSNotificationCenter defaultCenter] removeObserver:self];
+          }
+
+          - (void)refresh {
+              [self setNeedsDisplay];
+          }
+
+          - (UIColor *)foregroundColor {
+              NSInteger mode = [DuoState shared].colorMode;
+              if (mode == 1) return [UIColor whiteColor];
+              if (mode == 2) return [UIColor blackColor];
+
+              // Auto: ask the native item view's foreground style, then fall back to the status bar style.
+              UIView *item = self.superview;
+              if (item) {
+                  @try {
+                      id style = [item valueForKey:@"foregroundStyle"];
+                      if ([style respondsToSelector:@selector(tintColor)]) {
+                          UIColor *c = [style performSelector:@selector(tintColor)];
+                          if ([c isKindOfClass:[UIColor class]]) return c;
+                      }
+                  } @catch (__unused NSException *e) {}
+              }
+              UIApplication *app = [UIApplication sharedApplication];
+              return (app && app.statusBarStyle == UIStatusBarStyleLightContent) ? [UIColor whiteColor] : [UIColor blackColor];
+          }
+
+          - (void)drawRect:(CGRect)rect {
+              DuoState *st = [DuoState shared];
+              CGContextRef ctx = UIGraphicsGetCurrentContext();
+              if (!ctx) return;
+
+              UIDevice *dev = [UIDevice currentDevice];
+              float lvl = dev.batteryLevel;
+              if (lvl < 0.0f) lvl = 1.0f;
+              if (lvl > 1.0f) lvl = 1.0f;
+              UIDeviceBatteryState bs = dev.batteryState;
+              BOOL charging = (bs == UIDeviceBatteryStateCharging);
+              BOOL plugged = charging || (bs == UIDeviceBatteryStateFull);
+              BOOL lowPower = [[NSProcessInfo processInfo] isLowPowerModeEnabled];
+
+              UIColor *fg = [self foregroundColor];
+              UIColor *accent = fg;
+              if (plugged) accent = [UIColor colorWithRed:0.30 green:0.85 blue:0.39 alpha:1.0];
+              else if (lowPower) accent = [UIColor colorWithRed:1.0 green:0.80 blue:0.0 alpha:1.0];
+              else if (lvl <= 0.20f) accent = [UIColor colorWithRed:1.0 green:0.23 blue:0.19 alpha:1.0];
+
+              CGFloat s = [DuoGlyphView scale];
+              CGFloat side = [DuoGlyphView glyphSide];
+              CGRect b = self.bounds;
+              CGFloat gx = CGRectGetMaxX(b) - 1.0 - side;
+              CGFloat gy = floor(CGRectGetMidY(b) - side / 2.0);
+
+              // ---- Percentage text (left of the ring) and charging bolt -------------------------------
+              CGFloat leftEdge = gx; // x where the next element to the left must end
+              if (st.showPercent) {
+                  UIFont *font = [DuoGlyphView percentFont];
+                  NSMutableParagraphStyle *ps = [NSMutableParagraphStyle new];
+                  ps.alignment = NSTextAlignmentRight;
+                  NSDictionary *attrs = @{NSFontAttributeName: font, NSForegroundColorAttributeName: fg, NSParagraphStyleAttributeName: ps};
+                  NSString *txt = [NSString stringWithFormat:@"%d%%", (int)lroundf(lvl * 100.0f)];
+                  CGFloat pw = [DuoGlyphView percentWidth];
+                  CGFloat th = ceil(font.lineHeight);
+                  CGRect tr = CGRectMake(gx - 3.0 * s - pw, floor(CGRectGetMidY(b) - th / 2.0), pw, th);
+                  [txt drawInRect:tr withAttributes:attrs];
+                  leftEdge = CGRectGetMinX(tr);
+              }
+              if (charging) {
+                  CGFloat bx = leftEdge - 7.0 * s - 1.0;
+                  CGFloat by = CGRectGetMidY(b) - 5.2 * s;
+                  UIBezierPath *bolt = [UIBezierPath bezierPath];
+                  [bolt moveToPoint:CGPointMake(bx + 4.2 * s, by)];
+                  [bolt addLineToPoint:CGPointMake(bx, by + 5.8 * s)];
+                  [bolt addLineToPoint:CGPointMake(bx + 2.5 * s, by + 5.8 * s)];
+                  [bolt addLineToPoint:CGPointMake(bx + 1.6 * s, by + 10.4 * s)];
+                  [bolt addLineToPoint:CGPointMake(bx + 6.2 * s, by + 4.2 * s)];
+                  [bolt addLineToPoint:CGPointMake(bx + 3.6 * s, by + 4.2 * s)];
+                  [bolt closePath];
+                  [accent setFill];
+                  [bolt fill];
+              }
+
+              // ---- The glyph itself, drawn in a 24x24 design box ---------------------------------------
+              CGContextSaveGState(ctx);
+              CGContextTranslateCTM(ctx, gx, gy);
+              CGContextScaleCTM(ctx, side / kBox, side / kBox);
+
+              UIColor *dim = [fg colorWithAlphaComponent:0.28];
+              CGPoint c = CGPointMake(12.0, 12.0);
+              CGFloat R = 10.2;
+              CGFloat gap = 0.85; // half-angle of the opening at the bottom
+              CGFloat a0 = M_PI_2 + gap;
+              CGFloat a1 = 2.0 * M_PI + M_PI_2 - gap;
+
+              // Battery ring: open at the bottom, fills clockwise from the lower-left end.
+              UIBezierPath *track = [UIBezierPath bezierPathWithArcCenter:c radius:R startAngle:a0 endAngle:a1 clockwise:YES];
+              track.lineWidth = 2.4;
+              track.lineCapStyle = kCGLineCapRound;
+              [dim setStroke];
+              [track stroke];
+
+              CGFloat frac = MAX(0.02, MIN(1.0, (CGFloat)lvl));
+              UIBezierPath *fill = [UIBezierPath bezierPathWithArcCenter:c radius:R startAngle:a0 endAngle:a0 + (a1 - a0) * frac clockwise:YES];
+              fill.lineWidth = 2.4;
+              fill.lineCapStyle = kCGLineCapRound;
+              [accent setStroke];
+              [fill stroke];
+
+              // Wi-Fi in the center: dot plus up to three arcs.
+              if (st.wifiVisible) {
+                  CGPoint wc = CGPointMake(12.0, 15.4);
+                  [fg setFill];
+                  [[UIBezierPath bezierPathWithArcCenter:wc radius:1.15 startAngle:0 endAngle:2.0 * M_PI clockwise:YES] fill];
+                  CGFloat radii[3] = {2.8, 5.1, 7.4};
+                  for (int i = 0; i < 3; i++) {
+                      UIBezierPath *arc = [UIBezierPath bezierPathWithArcCenter:wc radius:radii[i] startAngle:5.0 * M_PI_4 endAngle:7.0 * M_PI_4 clockwise:YES];
+                      arc.lineWidth = 1.5;
+                      arc.lineCapStyle = kCGLineCapRound;
+                      [(i < st.wifiBars ? fg : dim) setStroke];
+                      [arc stroke];
+                  }
+              }
+
+              // Cellular: four dots in the opening of the ring.
+              NSInteger bars = st.cellBars;
+              NSInteger lit = bars <= 0 ? 0 : MIN(4, (NSInteger)lround(bars * 4.0 / 5.0));
+              if (bars > 0 && lit == 0) lit = 1;
+              for (int i = 0; i < 4; i++) {
+                  CGFloat x = 12.0 + (i - 1.5) * 3.4;
+                  UIBezierPath *dot = [UIBezierPath bezierPathWithArcCenter:CGPointMake(x, 21.2) radius:1.15 startAngle:0 endAngle:2.0 * M_PI clockwise:YES];
+                  [(i < lit ? fg : dim) setFill];
+                  [dot fill];
+              }
+
+              CGContextRestoreGState(ctx);
+          }
+
+          @end
+          __DUOEOF__
+          cat > DuoBar12/Tweak.xm <<'__DUOEOF__'
+          // DuoBar for iPhone 5s / iOS 12.
+          //
+          // iOS 12 on a non-notch iPhone still uses the LEGACY status bar (UIStatusBar + UIStatusBarItemView
+          // subclasses). Newer DuoBar builds hook the modern _UIStatusBar classes, which do not exist here, so
+          // this is a separate implementation with the same look:
+          //   - the battery item view hosts one custom glyph (ring + Wi-Fi + 4 cellular dots + percentage)
+          //   - the signal, Wi-Fi/data and battery-percentage item views collapse to zero width
+          //   - the signal and Wi-Fi item views are still read for their bar counts
+          #import <UIKit/UIKit.h>
+          #import <SystemConfiguration/SystemConfiguration.h>
+          #import <sys/socket.h>
+          #import <netinet/in.h>
+          #import <string.h>
+          #import <objc/runtime.h>
+          #import <objc/message.h>
+          #import "DuoGlyphView.h"
+
+          @interface UIStatusBarItemView : UIView
+          - (CGFloat)updateContentsAndWidth;
+          - (BOOL)updateForNewData:(id)data actions:(int)actions;
+          @end
+
+          @interface UIStatusBarBatteryItemView : UIStatusBarItemView
+          @end
+
+          @interface UIStatusBarBatteryItemView (DuoBar12)
+          @property (nonatomic, strong) DuoGlyphView *duoGlyph;
+          @end
+
+          @interface UIStatusBarBatteryPercentItemView : UIStatusBarItemView
+          @end
+
+          @interface UIStatusBarSignalStrengthItemView : UIStatusBarItemView
+          @end
+
+          @interface UIStatusBarDataNetworkItemView : UIStatusBarItemView
+          @end
+
+          #pragma mark - Helpers
+
+          static BOOL gIsSpringBoard = NO;
+
+          // SpringBoard is unsandboxed, so it can write a small log you can open in Filza:
+          // /var/mobile/duobar12.log
+          static void DuoLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+          static void DuoLog(NSString *fmt, ...) {
+              if (!gIsSpringBoard) return;
+              va_list ap;
+              va_start(ap, fmt);
+              NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+              va_end(ap);
+              NSLog(@"[DuoBar12] %@", msg);
+              NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+              NSString *path = @"/var/mobile/duobar12.log";
+              NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+              if (!fh) {
+                  [line writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+                  return;
+              }
+              [fh seekToEndOfFile];
+              [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+              [fh closeFile];
+          }
+
+          // Reads an integer-typed ivar by name without KVC exceptions; returns fallback if it is missing.
+          static long DuoReadInt(id obj, const char *name, long fallback) {
+              if (!obj) return fallback;
+              Ivar iv = class_getInstanceVariable(object_getClass(obj), name);
+              if (!iv) return fallback;
+              const char *enc = ivar_getTypeEncoding(iv);
+              if (!enc) return fallback;
+              uint8_t *base = (uint8_t *)(__bridge void *)obj;
+              void *p = base + ivar_getOffset(iv);
+              switch (enc[0]) {
+                  case 'i': return *(int *)p;
+                  case 'I': return (long)*(unsigned int *)p;
+                  case 's': return *(short *)p;
+                  case 'S': return *(unsigned short *)p;
+                  case 'q': return (long)*(long long *)p;
+                  case 'Q': return (long)*(unsigned long long *)p;
+                  case 'c': return *(signed char *)p;
+                  case 'C': return *(unsigned char *)p;
+                  case 'B': return *(bool *)p ? 1 : 0;
+                  default: return fallback;
+              }
+          }
+
+          // Fallback when the data-network type ivar cannot be read: reachable without WWAN means Wi-Fi.
+          static BOOL DuoWiFiReachable(void) {
+              struct sockaddr_in addr;
+              memset(&addr, 0, sizeof(addr));
+              addr.sin_len = sizeof(addr);
+              addr.sin_family = AF_INET;
+              SCNetworkReachabilityRef r = SCNetworkReachabilityCreateWithAddress(NULL, (const struct sockaddr *)&addr);
+              if (!r) return NO;
+              SCNetworkReachabilityFlags f = 0;
+              BOOL ok = SCNetworkReachabilityGetFlags(r, &f);
+              CFRelease(r);
+              return ok && (f & kSCNetworkReachabilityFlagsReachable) && !(f & kSCNetworkReachabilityFlagsIsWWAN);
+          }
+
+          // Ask the status bar to re-run item layout (applies size / enable changes without a respring).
+          static void DuoRefreshStatusBar(void) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  UIApplication *app = [UIApplication sharedApplication];
+                  if (!app) return;
+                  SEL sbSel = NSSelectorFromString(@"statusBar");
+                  if (![app respondsToSelector:sbSel]) return;
+                  id bar = ((id (*)(id, SEL))objc_msgSend)(app, sbSel);
+                  SEL upd = NSSelectorFromString(@"forceUpdateData:");
+                  if (bar && [bar respondsToSelector:upd]) {
+                      ((void (*)(id, SEL, BOOL))objc_msgSend)(bar, upd, YES);
+                  }
+              });
+          }
+
+          static void DuoPrefsChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+              [[DuoState shared] reloadPrefs];
+              [[DuoState shared] notifyChanged];
+              DuoRefreshStatusBar();
+          }
+
+          #pragma mark - Battery item: hosts the Duo glyph
+
+          %hook UIStatusBarBatteryItemView
+
+          %property (nonatomic, strong) DuoGlyphView *duoGlyph;
+
+          - (CGFloat)updateContentsAndWidth {
+              DuoState *st = [DuoState shared];
+              if (!st.enabled) {
+                  [self.duoGlyph removeFromSuperview];
+                  return %orig;
+              }
+
+              static BOOL logged = NO;
+              if (!logged) {
+                  logged = YES;
+                  DuoLog(@"battery item active, bounds=%@ hasForegroundStyle=%d", NSStringFromCGRect(self.bounds),
+                         (int)[self respondsToSelector:NSSelectorFromString(@"foregroundStyle")]);
+              }
+
+              DuoGlyphView *g = self.duoGlyph;
+              if (!g) {
+                  g = [[DuoGlyphView alloc] initWithFrame:self.bounds];
+                  self.duoGlyph = g;
+              }
+              if (g.superview != self) [self addSubview:g];
+              g.frame = self.bounds;
+              [g setNeedsDisplay];
+              return [DuoGlyphView preferredWidth];
+          }
+
+          - (void)layoutSubviews {
+              %orig;
+              DuoGlyphView *g = self.duoGlyph;
+              if (g.superview == self) g.frame = self.bounds;
+          }
+
+          %end
+
+          #pragma mark - Items that collapse into the glyph
+
+          %hook UIStatusBarBatteryPercentItemView
+
+          - (CGFloat)updateContentsAndWidth {
+              if (![DuoState shared].enabled) return %orig;
+              return 0.0;
+          }
+
+          %end
+
+          %hook UIStatusBarSignalStrengthItemView
+
+          - (BOOL)updateForNewData:(id)data actions:(int)actions {
+              BOOL r = %orig;
+              long bars = DuoReadInt(self, "_signalStrengthBars", -1);
+
+              static BOOL logged = NO;
+              if (!logged) {
+                  logged = YES;
+                  DuoLog(@"signal item: _signalStrengthBars=%ld", bars);
+              }
+
+              DuoState *st = [DuoState shared];
+              if (bars != st.cellBars) {
+                  st.cellBars = bars;
+                  [st notifyChanged];
+              }
+              return r;
+          }
+
+          - (CGFloat)updateContentsAndWidth {
+              if (![DuoState shared].enabled) return %orig;
+              return 0.0;
+          }
+
+          %end
+
+          %hook UIStatusBarDataNetworkItemView
+
+          - (BOOL)updateForNewData:(id)data actions:(int)actions {
+              BOOL r = %orig;
+              long type = DuoReadInt(self, "_dataNetworkType", -1);
+              long bars = DuoReadInt(self, "_wifiStrengthBars", 0);
+              BOOL wifi = (type >= 0) ? (type == 5) : DuoWiFiReachable();
+              if (bars < 0) bars = 0;
+              if (bars > 3) bars = 3;
+
+              static BOOL logged = NO;
+              if (!logged) {
+                  logged = YES;
+                  DuoLog(@"data item: _dataNetworkType=%ld _wifiStrengthBars=%ld wifi=%d", type, bars, (int)wifi);
+              }
+
+              DuoState *st = [DuoState shared];
+              if (wifi != st.wifiVisible || bars != st.wifiBars) {
+                  st.wifiVisible = wifi;
+                  st.wifiBars = bars;
+                  [st notifyChanged];
+              }
+              return r;
+          }
+
+          - (CGFloat)updateContentsAndWidth {
+              if (![DuoState shared].enabled) return %orig;
+              return 0.0;
+          }
+
+          %end
+
+          %ctor {
+              @autoreleasepool {
+                  (void)[DuoState shared];
+                  CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, DuoPrefsChanged,
+                                                  DUO_PREFS_NOTIFICATION, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+                  gIsSpringBoard = [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.springboard"];
+                  DuoLog(@"loaded; classes battery=%d percent=%d signal=%d data=%d",
+                         (int)(NSClassFromString(@"UIStatusBarBatteryItemView") != nil),
+                         (int)(NSClassFromString(@"UIStatusBarBatteryPercentItemView") != nil),
+                         (int)(NSClassFromString(@"UIStatusBarSignalStrengthItemView") != nil),
+                         (int)(NSClassFromString(@"UIStatusBarDataNetworkItemView") != nil));
+                  %init;
+              }
+          }
+          __DUOEOF__
+          cat > DuoBar12/duobarprefs/Makefile <<'__DUOEOF__'
+          TARGET := iphone:clang:latest:12.0
+          ARCHS = arm64
+
+          include $(THEOS)/makefiles/common.mk
+
+          BUNDLE_NAME = DuoBarPrefs
+
+          DuoBarPrefs_FILES = DuoRootListController.m
+          DuoBarPrefs_FRAMEWORKS = UIKit
+          DuoBarPrefs_PRIVATE_FRAMEWORKS = Preferences
+          DuoBarPrefs_INSTALL_PATH = /Library/PreferenceBundles
+          DuoBarPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+
+          include $(THEOS_MAKE_PATH)/bundle.mk
+          __DUOEOF__
+          cat > DuoBar12/duobarprefs/DuoRootListController.h <<'__DUOEOF__'
+          #import <Preferences/PSListController.h>
+
+          @interface DuoRootListController : PSListController
+          @end
+          __DUOEOF__
+          cat > DuoBar12/duobarprefs/DuoRootListController.m <<'__DUOEOF__'
+          #import "DuoRootListController.h"
+          #import <spawn.h>
+
+          #define DUO_DOMAIN_C CFSTR("local.duobar.ios12")
+          #define DUO_NOTIFY_C CFSTR("local.duobar.ios12/prefs")
+
+          @implementation DuoRootListController
+
+          - (NSArray *)specifiers {
+              if (!_specifiers) {
+                  _specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
+              }
+              return _specifiers;
+          }
+
+          - (void)resetSize {
+              CFPreferencesSetAppValue(CFSTR("SizeScale"), (__bridge CFPropertyListRef)@100, DUO_DOMAIN_C);
+              CFPreferencesAppSynchronize(DUO_DOMAIN_C);
+              CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), DUO_NOTIFY_C, NULL, NULL, YES);
+              [self reloadSpecifiers];
+          }
+
+          - (void)respring {
+              pid_t pid;
+              const char *args[] = {"killall", "-9", "SpringBoard", NULL};
+              posix_spawn(&pid, "/usr/bin/killall", NULL, NULL, (char *const *)args, NULL);
+          }
+
+          @end
+          __DUOEOF__
+          cat > DuoBar12/duobarprefs/Resources/Info.plist <<'__DUOEOF__'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>CFBundleDevelopmentRegion</key>
+          	<string>English</string>
+          	<key>CFBundleExecutable</key>
+          	<string>DuoBarPrefs</string>
+          	<key>CFBundleIdentifier</key>
+          	<string>local.duobar.ios12.prefs</string>
+          	<key>CFBundleInfoDictionaryVersion</key>
+          	<string>6.0</string>
+          	<key>CFBundlePackageType</key>
+          	<string>BNDL</string>
+          	<key>CFBundleShortVersionString</key>
+          	<string>1.0.0</string>
+          	<key>CFBundleVersion</key>
+          	<string>1.0.0</string>
+          	<key>NSPrincipalClass</key>
+          	<string>DuoRootListController</string>
+          </dict>
+          </plist>
+          __DUOEOF__
+          cat > DuoBar12/duobarprefs/Resources/Root.plist <<'__DUOEOF__'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>items</key>
+          	<array>
+          		<dict>
+          			<key>cell</key>
+          			<string>PSGroupCell</string>
+          			<key>label</key>
+          			<string>DuoBar</string>
+          			<key>footerText</key>
+          			<string>Circular battery, Wi-Fi and cellular indicator for iPhone 5s on iOS 12. If a change does not show up, tap Respring.</string>
+          		</dict>
+          		<dict>
+          			<key>cell</key>
+          			<string>PSSwitchCell</string>
+          			<key>label</key>
+          			<string>Enable DuoBar</string>
+          			<key>key</key>
+          			<string>Enabled</string>
+          			<key>default</key>
+          			<true/>
+          			<key>defaults</key>
+          			<string>local.duobar.ios12</string>
+          			<key>PostNotification</key>
+          			<string>local.duobar.ios12/prefs</string>
+          		</dict>
+          		<dict>
+          			<key>cell</key>
+          			<string>PSSwitchCell</string>
+          			<key>label</key>
+          			<string>Show Battery Percentage</string>
+          			<key>key</key>
+          			<string>ShowPercent</string>
+          			<key>default</key>
+          			<true/>
+          			<key>defaults</key>
+          			<string>local.duobar.ios12</string>
+          			<key>PostNotification</key>
+          			<string>local.duobar.ios12/prefs</string>
+          		</dict>
+          		<dict>
+          			<key>cell</key>
+          			<string>PSGroupCell</string>
+          			<key>label</key>
+          			<string>Size</string>
+          		</dict>
+          		<dict>
+          			<key>cell</key>
+          			<string>PSSliderCell</string>
+          			<key>key</key>
+          			<string>SizeScale</string>
+          			<key>default</key>
+          			<real>100</real>
+          			<key>min</key>
+          			<real>70</real>
+          			<key>max</key>
+          			<real>140</real>
+          			<key>showValue</key>
+          			<true/>
+          			<key>defaults</key>
+          			<string>local.duobar.ios12</string>
+          			<key>PostNotification</key>
+          			<string>local.duobar.ios12/prefs</string>
+          		</dict>
+          		<dict>
+          			<key>cell</key>
+          			<string>PSButtonCell</string>
+          			<key>label</key>
+          			<string>Reset Size to 100%</string>
+          			<key>action</key>
+          			<string>resetSize</string>
+          		</dict>
+          		<dict>
+          			<key>cell</key>
+          			<string>PSGroupCell</string>
+          			<key>label</key>
+          			<string>Color</string>
+          		</dict>
+          		<dict>
+          			<key>cell</key>
+          			<string>PSLinkListCell</string>
+          			<key>detail</key>
+          			<string>PSListItemsController</string>
+          			<key>label</key>
+          			<string>Icon Color</string>
+          			<key>key</key>
+          			<string>ColorMode</string>
+          			<key>default</key>
+          			<integer>0</integer>
+          			<key>defaults</key>
+          			<string>local.duobar.ios12</string>
+          			<key>validTitles</key>
+          			<array>
+          				<string>Automatic</string>
+          				<string>White</string>
+          				<string>Black</string>
+          			</array>
+          			<key>validValues</key>
+          			<array>
+          				<integer>0</integer>
+          				<integer>1</integer>
+          				<integer>2</integer>
+          			</array>
+          			<key>PostNotification</key>
+          			<string>local.duobar.ios12/prefs</string>
+          		</dict>
+          		<dict>
+          			<key>cell</key>
+          			<string>PSGroupCell</string>
+          		</dict>
+          		<dict>
+          			<key>cell</key>
+          			<string>PSButtonCell</string>
+          			<key>label</key>
+          			<string>Respring</string>
+          			<key>action</key>
+          			<string>respring</string>
+          		</dict>
+          	</array>
+          	<key>title</key>
+          	<string>DuoBar</string>
+          </dict>
+          </plist>
+          __DUOEOF__
+          cat > DuoBar12/layout/Library/PreferenceLoader/Preferences/DuoBar12.plist <<'__DUOEOF__'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>entry</key>
+          	<dict>
+          		<key>bundle</key>
+          		<string>DuoBarPrefs</string>
+          		<key>cell</key>
+          		<string>PSLinkCell</string>
+          		<key>detail</key>
+          		<string>DuoRootListController</string>
+          		<key>isController</key>
+          		<true/>
+          		<key>label</key>
+          		<string>DuoBar</string>
+          	</dict>
+          </dict>
+          </plist>
+          __DUOEOF__
+
+      - name: Build package
+        run: |
+          export THEOS="$HOME/theos"
+          cd DuoBar12
+          gmake package FINALPACKAGE=1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DuoBar-iOS12-5s-deb
+          path: DuoBar12/packages/*.deb
