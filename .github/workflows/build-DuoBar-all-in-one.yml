@@ -583,7 +583,9 @@ jobs:
 
           DuoBarPrefs_FILES = DuoRootListController.m
           DuoBarPrefs_FRAMEWORKS = UIKit
-          DuoBarPrefs_PRIVATE_FRAMEWORKS = Preferences
+          # The runner's SDK has no Preferences.framework stub to link against. Settings already has it loaded
+          # when this bundle opens, so let those symbols resolve at runtime instead of at link time.
+          DuoBarPrefs_LDFLAGS = -undefined dynamic_lookup
           DuoBarPrefs_INSTALL_PATH = /Library/PreferenceBundles
           DuoBarPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 
