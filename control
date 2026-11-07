@@ -1,0 +1,9 @@
+Package: local.duobar.ios12
+Name: DuoBar (iPhone 5s, iOS 12)
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Duo-style circular battery, Wi-Fi and cellular indicator for the legacy iOS 12 status bar (iPhone 5s).
+Maintainer: DuoBar iOS 12 port
+Author: Inspired by DuoBar by RBx9 and Mikeli7666 (both MIT)
+Section: Tweaks
+Depends: mobilesubstrate, preferenceloader, firmware (>= 12.0), firmware (<< 13.0)
