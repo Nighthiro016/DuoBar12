@@ -9,7 +9,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Install tools
         run: brew install ldid dpkg make
