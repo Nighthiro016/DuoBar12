@@ -7,7 +7,7 @@ BUNDLE_NAME = DuoBarPrefs
 
 DuoBarPrefs_FILES = DuoRootListController.m
 DuoBarPrefs_FRAMEWORKS = UIKit
-DuoBarPrefs_PRIVATE_FRAMEWORKS = Preferences
+DuoBarPrefs_LDFLAGS = -undefined dynamic_lookup
 DuoBarPrefs_INSTALL_PATH = /Library/PreferenceBundles
 DuoBarPrefs_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
 
